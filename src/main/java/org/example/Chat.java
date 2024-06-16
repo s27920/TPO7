@@ -8,12 +8,12 @@ import java.time.Duration;
 import java.time.LocalDateTime;
 import java.time.format.DateTimeFormatter;
 import java.time.temporal.ChronoUnit;
+import java.util.HashSet;
 import java.util.Map;
-import java.util.concurrent.ConcurrentHashMap;
-import java.util.concurrent.ExecutorService;
-import java.util.concurrent.Executors;
+import java.util.Set;
+import java.util.concurrent.*;
 
-public class Chat extends JFrame {
+public class ChatApp extends JFrame {
     private JPanel panel1;
     private JTextArea chatArea;
     private JTabbedPane tabbedPane1;
@@ -25,110 +25,68 @@ public class Chat extends JFrame {
     private JTextField userName;
     private JTextArea activeUsersField;
 
-    private final MessageConsumer generalAdminChat;
-    private MessageConsumer currChat;
-    private MessageConsumer currChatAdmin;
+    private String currentChat;
+    private String currentUser;
+    private final Set<String> activeUsers = new HashSet<>();
+    private final Set<String> activeChats = new HashSet<>();
 
-    private final ExecutorService clientThreadPool;
-    private final DateTimeFormatter formatter;
-
-    private ConcurrentHashMap<String, Integer> activeClients;
-    private final ConcurrentHashMap<String, Integer> activeChats;
-    private String topic;
-    private String id;
-    private String adminChat = "SUPERSECRETADMINCHANNELPLEASEDONOTENTER";
-
-    public Chat() throws HeadlessException {
-        this.add(panel1);
-        this.pack();
-        this.setResizable(false);
-        this.setDefaultCloseOperation(EXIT_ON_CLOSE);
-        this.setVisible(true);
-        generalAdminChat = new MessageConsumer(adminChat, "admin");
-        activeChats = new ConcurrentHashMap<>();
-        clientThreadPool = Executors.newFixedThreadPool(2);
-        formatter = DateTimeFormatter.ofPattern("HH:mm:ss");
-
-        joinCreateChatButton.addActionListener(e -> login());
-        sendButton.addActionListener(e -> sendMessage(topic, id));
-        clientThreadPool.submit(() -> {
-            while (!Thread.currentThread().isInterrupted()) {
-                if (currChatAdmin != null) {
-                    StringBuilder builder = new StringBuilder();
-                    getFromAdminChannels(currChatAdmin, activeClients);
-                    for (Map.Entry<String, Integer> entry : activeClients.entrySet()) {
-                        if ((entry.getValue() & 1) == 1) {
-                            builder.append(entry.getKey()).append("\n");
-                        }
-                    }
-                    String activeUsers = builder.toString();
-                    SwingUtilities.invokeLater(() -> activeUsersField.setText(activeUsers));
-                }
-                getFromAdminChannels(generalAdminChat, activeChats);
-                StringBuilder sets = new StringBuilder();
-                for (Map.Entry<String, Integer> entry : activeChats.entrySet()) {
-                    sets.append(entry.getKey()).append("\n");
-                }
-                String activeChats = sets.toString();
-                SwingUtilities.invokeLater(() -> activeChatsField.setText(activeChats));
-                try {
-                    Thread.sleep(100);
-                } catch (InterruptedException e) {
-                    Thread.currentThread().interrupt();
-                }
-            }
-        });
-
+    public ChatApp() {
+        setupUI();
+        setupListeners();
     }
 
-    private void login() {
-        if (joinCreateChatButton.getText().equals("join/create Chat")) {
-            topic = ChatNameField.getText();
-            id = userName.getText();
-            if (!topic.isEmpty() && !id.isEmpty()) {
-                createChatReader(topic, id);
-                joinCreateChatButton.setText("log out");
-                sendMessageToProducer(topic + "Admin", id);
-                sendMessageToProducer(adminChat, topic +"\n");
-                activeClients = new ConcurrentHashMap<>();
-            }
-        } else {
-            destroyChatReader();
+    private void setupUI() {
+        JFrame frame = new JFrame("Chat App");
+        frame.setContentPane(panel1);
+        frame.setDefaultCloseOperation(JFrame.EXIT_ON_CLOSE);
+        frame.setSize(800, 600);
+        frame.setVisible(true);
+    }
+
+    private void setupListeners() {
+        sendButton.addActionListener(e -> sendMessage());
+        joinCreateChatButton.addActionListener(e -> joinOrCreateChat());
+
+        // Refresh active users and chats periodically
+        ScheduledExecutorService scheduler = Executors.newScheduledThreadPool(1);
+        scheduler.scheduleAtFixedRate(this::refreshActiveUsersAndChats, 0, 5, TimeUnit.SECONDS);
+    }
+
+    private void joinOrCreateChat() {
+        currentChat = ChatNameField.getText();
+        currentUser = userName.getText();
+        if (!currentChat.isEmpty() && !currentUser.isEmpty()) {
+            activeChats.add(currentChat);
+            activeUsers.add(currentUser);
+            MessageConsumer consumer = new MessageConsumer(currentChat, currentUser);
+            new Thread(() -> {
+                while (true) {
+                    consumer.kafkaConsumer.poll(Duration.ofMillis(100)).forEach(record -> {
+                        chatArea.append(record.value() + "\n");
+                    });
+                }
+            }).start();
         }
     }
 
-    private void createChatReader(String topic, String id) {
-        currChat = new MessageConsumer(topic, id);
-        currChatAdmin = new MessageConsumer(topic + "Admin", id);
-        clientThreadPool.submit(() -> {
-            while (currChat != null) {
-                currChat.kafkaConsumer.poll(Duration.of(1, ChronoUnit.SECONDS)).forEach(mes -> SwingUtilities.invokeLater(()->chatArea.append(mes.value())));
-            }
-        });
-    }
-
-    private void destroyChatReader() {
-        sendMessageToProducer(topic + "Admin", id);
-        activeUsersField.setText("");
-        chatArea.setText("");
-        joinCreateChatButton.setText("join/create Chat");
-        currChat = null;
-        currChatAdmin = null;
-        activeClients = new ConcurrentHashMap<>();
-    }
-
-    private void sendMessage(String topic, String id) {
-        if (currChat != null) {
-            sendMessageToProducer(topic, LocalDateTime.now().format(formatter) + " " + id + ": " + chatInput.getText());
+    private void sendMessage() {
+        String message = chatInput.getText();
+        if (!message.isEmpty() && currentChat != null && currentUser != null) {
+            String formattedMessage = String.format("[%s] %s: %s",
+                    LocalDateTime.now().format(DateTimeFormatter.ofPattern("HH:mm:ss")),
+                    currentUser, message);
+            MessageProducer.send(new ProducerRecord<>(currentChat, formattedMessage));
             chatInput.setText("");
         }
     }
 
-    private void sendMessageToProducer(String topic, String message) {
-        MessageProducer.send(new ProducerRecord<>(topic, message + "\n"));
+    private void refreshActiveUsersAndChats() {
+        // Update the active users and chats text areas
+        activeUsersField.setText(String.join("\n", activeUsers));
+        activeChatsField.setText(String.join("\n", activeChats));
     }
 
-    private void getFromAdminChannels(MessageConsumer consumer, ConcurrentHashMap<String, Integer> active) {
-        consumer.kafkaConsumer.poll(Duration.of(100, ChronoUnit.MILLIS)).forEach(mes -> active.merge(mes.value(), 1, Integer::sum));
+    public static void main(String[] args) {
+        SwingUtilities.invokeLater(ChatApp::new);
     }
 }
