@@ -4,6 +4,8 @@ import org.apache.kafka.clients.producer.ProducerRecord;
 
 import javax.swing.*;
 import java.awt.*;
+import java.awt.event.KeyAdapter;
+import java.awt.event.KeyEvent;
 import java.time.Duration;
 import java.time.LocalDateTime;
 import java.time.format.DateTimeFormatter;
@@ -13,7 +15,7 @@ import java.util.Map;
 import java.util.Set;
 import java.util.concurrent.*;
 
-public class ChatApp extends JFrame {
+public class Chat extends JFrame {
     private JPanel panel1;
     private JTextArea chatArea;
     private JTabbedPane tabbedPane1;
@@ -25,68 +27,125 @@ public class ChatApp extends JFrame {
     private JTextField userName;
     private JTextArea activeUsersField;
 
-    private String currentChat;
-    private String currentUser;
-    private final Set<String> activeUsers = new HashSet<>();
-    private final Set<String> activeChats = new HashSet<>();
+    private final ScheduledExecutorService clientThreadPool;
+    private final DateTimeFormatter formatter;
 
-    public ChatApp() {
-        setupUI();
-        setupListeners();
-    }
+    private final ConcurrentHashMap<String, Integer> activeChats;
+    private ConcurrentHashMap<String, Integer> activeClients;
 
-    private void setupUI() {
-        JFrame frame = new JFrame("Chat App");
-        frame.setContentPane(panel1);
-        frame.setDefaultCloseOperation(JFrame.EXIT_ON_CLOSE);
-        frame.setSize(800, 600);
-        frame.setVisible(true);
-    }
+    private static final String adminChat = "SUPERSECRETADMINCHANNELPLEASEDONOTENTER";
+    private String topic;
+    private String id;
 
-    private void setupListeners() {
-        sendButton.addActionListener(e -> sendMessage());
-        joinCreateChatButton.addActionListener(e -> joinOrCreateChat());
+    private static final MessageConsumer generalAdminChat = new MessageConsumer(adminChat, "admin");
+    private MessageConsumer currChatAdmin;
+    private MessageConsumer currChat;
+    private boolean loggedIn;
+    private ScheduledFuture<?> readerTask;
 
-        // Refresh active users and chats periodically
-        ScheduledExecutorService scheduler = Executors.newScheduledThreadPool(1);
-        scheduler.scheduleAtFixedRate(this::refreshActiveUsersAndChats, 0, 5, TimeUnit.SECONDS);
-    }
+    public Chat() throws HeadlessException {
+        loggedIn = false;
+        activeChats = new ConcurrentHashMap<>();
+        clientThreadPool = Executors.newScheduledThreadPool(2);
+        formatter = DateTimeFormatter.ofPattern("HH:mm:ss");
 
-    private void joinOrCreateChat() {
-        currentChat = ChatNameField.getText();
-        currentUser = userName.getText();
-        if (!currentChat.isEmpty() && !currentUser.isEmpty()) {
-            activeChats.add(currentChat);
-            activeUsers.add(currentUser);
-            MessageConsumer consumer = new MessageConsumer(currentChat, currentUser);
-            new Thread(() -> {
-                while (true) {
-                    consumer.kafkaConsumer.poll(Duration.ofMillis(100)).forEach(record -> {
-                        chatArea.append(record.value() + "\n");
-                    });
+        joinCreateChatButton.addActionListener(e -> login());
+        sendButton.addActionListener(e -> sendMessage(topic, id));
+        chatInput.addKeyListener(new KeyAdapter() {
+            @Override
+            public void keyPressed(KeyEvent e) {
+                if (e.getKeyCode() == KeyEvent.VK_ENTER) {
+                    sendMessage(topic,id);
                 }
-            }).start();
+            }
+        });
+
+        Timer timer = new Timer(10, (e) -> {
+            if (currChatAdmin != null) {
+                StringBuilder builder = new StringBuilder();
+                getFromAdminChannels(currChatAdmin, activeClients);
+                for (Map.Entry<String, Integer> entry : activeClients.entrySet()) {
+                    if ((entry.getValue() & 1) == 1) {
+                        builder.append(entry.getKey());
+                    }
+                }
+                String activeUsers = builder.toString();
+                SwingUtilities.invokeLater(() -> activeUsersField.setText(activeUsers));
+            }
+            getFromAdminChannels(generalAdminChat, activeChats);
+            StringBuilder sets = new StringBuilder();
+            activeChats.forEach((k, v) -> sets.append(k));
+            SwingUtilities.invokeLater(() -> activeChatsField.setText(sets.toString()));
+        });
+        timer.start();
+
+        this.add(panel1);
+        this.pack();
+        this.setResizable(false);
+        this.setDefaultCloseOperation(EXIT_ON_CLOSE);
+        this.setVisible(true);
+    }
+
+    private void login() {
+        if (!loggedIn) {
+            topic = ChatNameField.getText();
+            id = userName.getText();
+            if (!topic.isEmpty() && !id.isEmpty()) {
+                createChatReader(topic, id);
+                SwingUtilities.invokeLater(() -> joinCreateChatButton.setText("log out"));
+                ChatNameField.setEnabled(false);
+                sendMessageToProducer(topic + "Admin", id);
+                loggedIn = !loggedIn;
+            }
+        } else {
+            destroyChatReader();
+            loggedIn = !loggedIn;
         }
     }
 
-    private void sendMessage() {
-        String message = chatInput.getText();
-        if (!message.isEmpty() && currentChat != null && currentUser != null) {
-            String formattedMessage = String.format("[%s] %s: %s",
-                    LocalDateTime.now().format(DateTimeFormatter.ofPattern("HH:mm:ss")),
-                    currentUser, message);
-            MessageProducer.send(new ProducerRecord<>(currentChat, formattedMessage));
-            chatInput.setText("");
+    private void createChatReader(String topic, String id) {
+        activeClients = new ConcurrentHashMap<>();
+        sendMessageToProducer(adminChat, topic);
+        activeChats.putIfAbsent(topic+"\n", 1);
+        currChat = new MessageConsumer(topic, id);
+        currChatAdmin = new MessageConsumer(topic + "Admin", id);
+        readerTask = clientThreadPool.scheduleAtFixedRate(() -> {
+            if (currChat != null) {
+                System.out.println("this is " + id + " reading from " + topic);
+                currChat.kafkaConsumer.poll(Duration.of(1, ChronoUnit.SECONDS)).forEach(mes -> SwingUtilities.invokeLater(() -> chatArea.append(mes.value())));
+            }else {
+                System.out.println("this is: " + id + "signing out od: " + topic);
+                readerTask.cancel(false);
+            }
+        }, 0, 1, TimeUnit.SECONDS);
+    }
+
+    private void destroyChatReader() {
+        sendMessageToProducer(topic + "Admin", id);
+        currChatAdmin = null;
+        currChat = null;
+        SwingUtilities.invokeLater(() -> activeUsersField.setText(""));
+        SwingUtilities.invokeLater(() -> chatArea.setText(""));
+        SwingUtilities.invokeLater(() -> joinCreateChatButton.setText("join/create Chat"));
+        ChatNameField.setEnabled(true);
+    }
+
+    private void sendMessage(String topic, String id) {
+        if (currChat != null) {
+            sendMessageToProducer(topic, LocalDateTime.now().format(formatter) + " " + id + ": " + chatInput.getText());
+            SwingUtilities.invokeLater(() -> chatInput.setText(""));
         }
     }
 
-    private void refreshActiveUsersAndChats() {
-        // Update the active users and chats text areas
-        activeUsersField.setText(String.join("\n", activeUsers));
-        activeChatsField.setText(String.join("\n", activeChats));
+    private void sendMessageToProducer(String topic, String message) {
+        MessageProducer.send(new ProducerRecord<>(topic, message + "\n"));
+    }
+
+    private void getFromAdminChannels(MessageConsumer consumer, ConcurrentHashMap<String, Integer> active) {
+        consumer.kafkaConsumer.poll(Duration.of(10, ChronoUnit.MILLIS)).forEach(mes -> active.merge(mes.value(), 1, Integer::sum));
     }
 
     public static void main(String[] args) {
-        SwingUtilities.invokeLater(ChatApp::new);
+        SwingUtilities.invokeLater(Chat::new);
     }
 }
