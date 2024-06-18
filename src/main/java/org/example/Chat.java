@@ -32,6 +32,7 @@ public class Chat extends JFrame {
 
     private final ConcurrentHashMap<String, Integer> activeChats;
     private ConcurrentHashMap<String, Integer> activeClients;
+    private ConcurrentHashMap< String,MessageConsumer[]> consumers;
 
     private static final String adminChat = "SUPERSECRETADMINCHANNELPLEASEDONOTENTER";
     private String topic;
@@ -44,6 +45,7 @@ public class Chat extends JFrame {
     private ScheduledFuture<?> readerTask;
 
     public Chat() throws HeadlessException {
+        consumers = new ConcurrentHashMap<>();
         loggedIn = false;
         activeChats = new ConcurrentHashMap<>();
         clientThreadPool = Executors.newScheduledThreadPool(2);
@@ -94,6 +96,7 @@ public class Chat extends JFrame {
                 createChatReader(topic, id);
                 SwingUtilities.invokeLater(() -> joinCreateChatButton.setText("log out"));
                 ChatNameField.setEnabled(false);
+                userName.setEnabled(false);
                 sendMessageToProducer(topic + "Admin", id);
                 loggedIn = !loggedIn;
             }
@@ -107,14 +110,17 @@ public class Chat extends JFrame {
         activeClients = new ConcurrentHashMap<>();
         sendMessageToProducer(adminChat, topic);
         activeChats.putIfAbsent(topic+"\n", 1);
-        currChat = new MessageConsumer(topic, id);
-        currChatAdmin = new MessageConsumer(topic + "Admin", id);
+        if (consumers.get(topic)!=null){
+            currChat = consumers.get(topic)[0];
+            currChatAdmin = consumers.get(topic)[1];
+        }else {
+            currChat = new MessageConsumer(topic, id);
+            currChatAdmin = new MessageConsumer(topic + "Admin", id);
+        }
         readerTask = clientThreadPool.scheduleAtFixedRate(() -> {
             if (currChat != null) {
-                System.out.println("this is " + id + " reading from " + topic);
                 currChat.kafkaConsumer.poll(Duration.of(1, ChronoUnit.SECONDS)).forEach(mes -> SwingUtilities.invokeLater(() -> chatArea.append(mes.value())));
             }else {
-                System.out.println("this is: " + id + "signing out od: " + topic);
                 readerTask.cancel(false);
             }
         }, 0, 1, TimeUnit.SECONDS);
@@ -122,12 +128,14 @@ public class Chat extends JFrame {
 
     private void destroyChatReader() {
         sendMessageToProducer(topic + "Admin", id);
+        consumers.putIfAbsent(topic, new MessageConsumer[]{currChat, currChatAdmin});
         currChatAdmin = null;
         currChat = null;
         SwingUtilities.invokeLater(() -> activeUsersField.setText(""));
         SwingUtilities.invokeLater(() -> chatArea.setText(""));
         SwingUtilities.invokeLater(() -> joinCreateChatButton.setText("join/create Chat"));
         ChatNameField.setEnabled(true);
+        userName.setEnabled(true);
     }
 
     private void sendMessage(String topic, String id) {
@@ -143,9 +151,5 @@ public class Chat extends JFrame {
 
     private void getFromAdminChannels(MessageConsumer consumer, ConcurrentHashMap<String, Integer> active) {
         consumer.kafkaConsumer.poll(Duration.of(10, ChronoUnit.MILLIS)).forEach(mes -> active.merge(mes.value(), 1, Integer::sum));
-    }
-
-    public static void main(String[] args) {
-        SwingUtilities.invokeLater(Chat::new);
     }
 }
